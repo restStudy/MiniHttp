@@ -1,6 +1,5 @@
 // =========================================================================
-//  MiniHttp.HttpServer  –  轻量级 HTTP/HTTPS/WebSocket 服务器
-//  目标框架：.NET Framework 4.8      语言版本：C# 8.0+
+//  MiniHttp.HttpServer  –  v2.2 (最终典藏版)
 // =========================================================================
 
 using System;
@@ -19,6 +18,9 @@ using System.Threading.Tasks;
 
 namespace MiniHttp
 {
+    /// <summary>
+    /// 一个轻量级的、基于 HttpListener 的多功能 HTTP/HTTPS 服务器。
+    /// </summary>
     public sealed class HttpServer : IDisposable
     {
         #region 1. 字段 / 构造 / 启停
@@ -28,8 +30,8 @@ namespace MiniHttp
 
         public int HttpPort { get; }
         public int? HttpsPort { get; }
-
         public bool IsRunning => _listener.IsListening;
+        private bool _isSslBound;
 
         public HttpServer(int httpPort = 80, int? httpsPort = null)
         {
@@ -41,30 +43,71 @@ namespace MiniHttp
         {
             if (IsRunning) return;
 
-            // 如需 HTTPS 且传入证书，则自动绑定（首次需管理员）
             if (HttpsPort.HasValue && httpsCert != null)
-                SslBinder.Bind(HttpsPort.Value, httpsCert);
+            {
+                // 【强制清场修正】在绑定前，先尝试进行一次清理。
+                try
+                {
+                    SslBinder.Unbind(IPAddress.Any, HttpsPort.Value);
+                    Console.WriteLine($"[Info] 启动前预清理端口 {HttpsPort.Value} 成功。");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Warning] 启动前预清理端口失败（可能端口本就干净）: {ex.Message}");
+                }
 
-            if (HttpPort > 0)
-                _listener.Prefixes.Add($"http://+:{HttpPort}/");
-            if (HttpsPort.HasValue)
-                _listener.Prefixes.Add($"https://+:{HttpsPort.Value}/");
+                try
+                {
+                    SslBinder.Bind(IPAddress.Any, HttpsPort.Value, httpsCert);
+                    _isSslBound = true;
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception($"为所有IP地址绑定SSL证书到端口 {HttpsPort.Value} 时失败。", ex);
+                }
+            }
 
-            if (_listener.Prefixes.Count == 0)
-                throw new InvalidOperationException("未指定任何前缀。");
+            if (HttpPort > 0) _listener.Prefixes.Add($"http://+:{HttpPort}/");
+            if (HttpsPort.HasValue) _listener.Prefixes.Add($"https://+:{HttpsPort.Value}/");
+            if (_listener.Prefixes.Count == 0) throw new InvalidOperationException("未指定任何前缀。");
 
             _listener.Start();
             _cts = new CancellationTokenSource();
             _ = Task.Run(() => AcceptLoop(_cts.Token));
-
-            ThreadPool.SetMinThreads(200, 200); // 预热线程池（可酌情调整）
+            ThreadPool.SetMinThreads(200, 200);
         }
 
         public void Stop()
         {
-            if (!IsRunning) return;
-            _cts?.Cancel();
-            _listener.Stop();
+            if (!IsRunning && !_isSslBound) return;
+
+            try
+            {
+                if (IsRunning)
+                {
+                    _cts?.Cancel();
+                    _listener.Stop();
+                }
+            }
+            finally
+            {
+                if (_isSslBound && HttpsPort.HasValue)
+                {
+                    try
+                    {
+                        SslBinder.Unbind(IPAddress.Any, HttpsPort.Value);
+                        Console.WriteLine($"[Info] SSL 证书已成功从端口 {HttpsPort.Value} 解除绑定。");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[Warning] 自动解除SSL证书绑定失败: {ex.Message}");
+                        Console.WriteLine(
+                            $"[Warning] 您可能需要手动运行 'netsh http delete sslcert ipport=0.0.0.0:{HttpsPort.Value}' 来清理。");
+                    }
+
+                    _isSslBound = false;
+                }
+            }
         }
 
         public void Dispose() => Stop();
@@ -79,6 +122,9 @@ namespace MiniHttp
         private readonly ConcurrentDictionary<(string, string), Func<WebSocket, Task>> _wsRoutes
             = new ConcurrentDictionary<(string, string), Func<WebSocket, Task>>();
 
+        private readonly ConcurrentDictionary<string, StaticDirEntry> _hostRoots
+            = new ConcurrentDictionary<string, StaticDirEntry>(StringComparer.OrdinalIgnoreCase);
+
         private readonly ConcurrentDictionary<(string, string), StaticDirEntry> _staticDirs
             = new ConcurrentDictionary<(string, string), StaticDirEntry>();
 
@@ -92,9 +138,20 @@ namespace MiniHttp
 
         #region 3. 注册 API
 
-        /*----- 动态 HTTP -----*/
-        public void AddRoute(string? host, string method, string path,
-            Func<HttpListenerContext, Task> handler)
+        public void MapHostToRoot(string host, string physicalDir, bool browse = false)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+                throw new ArgumentException("host 不能为空。");
+
+            var fullDir = Path.GetFullPath(physicalDir);
+            if (!Directory.Exists(fullDir))
+                throw new DirectoryNotFoundException(fullDir);
+
+            _hostRoots[host.ToLowerInvariant()] = new StaticDirEntry
+                { PhysicalDir = fullDir, EnableBrowse = browse };
+        }
+
+        public void AddRoute(string? host, string method, string path, Func<HttpListenerContext, Task> handler)
         {
             host ??= "*";
             if (string.IsNullOrWhiteSpace(path) || path[0] != '/')
@@ -103,12 +160,9 @@ namespace MiniHttp
                 handler ?? throw new ArgumentNullException(nameof(handler));
         }
 
-        public void AddTextRoute(string? host, string path, string text,
-            string ct = "text/plain; charset=utf-8") =>
-            AddRoute(host, "GET", path,
-                ctx => WriteTextAsync(ctx, text, ct));
+        public void AddTextRoute(string? host, string path, string text, string ct = "text/plain; charset=utf-8") =>
+            AddRoute(host, "GET", path, ctx => WriteTextAsync(ctx, text, ct));
 
-        /*----- WebSocket -----*/
         public void AddWebSocket(string? host, string path, Func<WebSocket, Task> onConnected)
         {
             host ??= "*";
@@ -118,14 +172,12 @@ namespace MiniHttp
                 onConnected ?? throw new ArgumentNullException(nameof(onConnected));
         }
 
-        /*----- 静态目录 -----*/
-        public void AddStaticFolder(string? host, string requestPrefix,
-            string physicalDir, bool browse = false)
+        public void AddStaticFolder(string? host, string requestPrefix, string physicalDir, bool browse = false)
         {
             host ??= "*";
             if (string.IsNullOrWhiteSpace(requestPrefix) || requestPrefix[0] != '/')
                 throw new ArgumentException("requestPrefix 必须以 / 开头");
-            requestPrefix = requestPrefix.TrimEnd('/'); // "/static"
+            requestPrefix = requestPrefix.TrimEnd('/');
             var fullDir = Path.GetFullPath(physicalDir);
             if (!Directory.Exists(fullDir))
                 throw new DirectoryNotFoundException(fullDir);
@@ -139,7 +191,7 @@ namespace MiniHttp
 
         #endregion
 
-        #region 4. Accept & Process
+        #region 4. Accept & Process (已修复)
 
         private async Task AcceptLoop(CancellationToken token)
         {
@@ -155,50 +207,83 @@ namespace MiniHttp
                     break;
                 }
 
-                _ = Task.Run(() => ProcessAsync(ctx));
+                _ = Task.Run(() => ProcessAsync(ctx), token);
             }
         }
 
+        // 在 HttpServer.cs 中找到并替换此方法
         private async Task ProcessAsync(HttpListenerContext ctx)
         {
             string host = (ctx.Request.UserHostName ?? "*").ToLowerInvariant();
             string path = ctx.Request.Url!.AbsolutePath;
             string method = ctx.Request.HttpMethod.ToUpperInvariant();
 
-            /*1) WebSocket*/
-            if (ctx.Request.IsWebSocketRequest)
+            try
             {
-                if (TryWs(host, path, out var wsHandler))
+                // === 新的路由处理顺序 ===
+
+                // 1. WebSocket (保持最高优先级)
+                if (ctx.Request.IsWebSocketRequest)
                 {
-                    var wsCtx = await ctx.AcceptWebSocketAsync(null);
-                    await wsHandler(wsCtx.WebSocket);
+                    if (TryWs(host, path, out var wsHandler))
+                    {
+                        var wsCtx = await ctx.AcceptWebSocketAsync(null);
+                        await wsHandler(wsCtx.WebSocket);
+                    }
+                    else ctx.Response.StatusCode = 404;
+
+                    return;
                 }
-                else ctx.Response.StatusCode = 404;
 
-                SafeClose(ctx);
-                return;
+                // 2. 动态API路由 (优先级提升！)
+                if (_httpRoutes.TryGetValue((method, host, path), out var h1) ||
+                    _httpRoutes.TryGetValue((method, "*", path), out h1))
+                {
+                    await h1(ctx);
+                    return;
+                }
+
+                // 3. 域名根目录映射 (现在是第三优先级)
+                if (_hostRoots.TryGetValue(host, out var hostDirEntry))
+                {
+                    await ServeStaticAsync(ctx, hostDirEntry, path.TrimStart('/'));
+                    return;
+                }
+
+                if (_hostRoots.TryGetValue("*", out var wildcardDirEntry))
+                {
+                    await ServeStaticAsync(ctx, wildcardDirEntry, path.TrimStart('/'));
+                    return;
+                }
+
+                // 4. 静态子目录 (优先级降低)
+                if (TryStatic(host, path, out var dir, out var rel))
+                {
+                    await ServeStaticAsync(ctx, dir, rel);
+                    return;
+                }
+
+                // 5. 404 Not Found
+                ctx.Response.StatusCode = 404;
+                await WriteTextAsync(ctx, "404 Not Found");
             }
-
-            /*2) 静态目录*/
-            if (TryStatic(host, path, out var dir, out var rel))
+            catch (Exception ex)
             {
-                await ServeStaticAsync(ctx, dir, rel);
-                return;
+                Console.WriteLine($"[Error] Processing request for {ctx.Request.Url}: {ex.Message}\n{ex.StackTrace}");
+                try
+                {
+                    ctx.Response.StatusCode = 500;
+                    await WriteTextAsync(ctx, "500 Internal Server Error");
+                }
+                catch (Exception responseEx)
+                {
+                    Console.WriteLine($"[Error] Could not send 500 response: {responseEx.Message}");
+                }
             }
-
-            /*3) 动态路由*/
-            if (_httpRoutes.TryGetValue((method, host, path), out var h1) ||
-                _httpRoutes.TryGetValue((method, "*", path), out h1))
+            finally
             {
-                await h1(ctx);
                 SafeClose(ctx);
-                return;
             }
-
-            /*4) 404*/
-            ctx.Response.StatusCode = 404;
-            await WriteTextAsync(ctx, "404 Not Found");
-            SafeClose(ctx);
         }
 
         #endregion
@@ -219,7 +304,7 @@ namespace MiniHttp
         {
             foreach (var kv in _staticDirs)
             {
-                var (hostKey, prefixKey) = kv.Key; // 拆包
+                var (hostKey, prefixKey) = kv.Key;
 
                 if (hostKey != "*" && hostKey != h) continue;
                 if (p.StartsWith(prefixKey, StringComparison.OrdinalIgnoreCase))
@@ -376,11 +461,16 @@ namespace MiniHttp
 
         private static readonly Dictionary<string, string> _mime = new(StringComparer.OrdinalIgnoreCase)
         {
-            [".html"] = "text/html; charset=utf-8", [".htm"] = "text/html; charset=utf-8",
-            [".js"] = "application/javascript", [".css"] = "text/css",
-            [".png"] = "image/png", [".jpg"] = "image/jpeg",
-            [".jpeg"] = "image/jpeg", [".gif"] = "image/gif",
-            [".svg"] = "image/svg+xml", [".json"] = "application/json",
+            [".html"] = "text/html; charset=utf-8",
+            [".htm"] = "text/html; charset=utf-8",
+            [".js"] = "application/javascript",
+            [".css"] = "text/css",
+            [".png"] = "image/png",
+            [".jpg"] = "image/jpeg",
+            [".jpeg"] = "image/jpeg",
+            [".gif"] = "image/gif",
+            [".svg"] = "image/svg+xml",
+            [".json"] = "application/json",
             [".txt"] = "text/plain; charset=utf-8"
         };
 
@@ -389,83 +479,145 @@ namespace MiniHttp
 
         #endregion
 
-        #region 8. SSL 绑定(可选)
+        #region 8. SSL 绑定 (最终典藏版)
 
-        private static class SslBinder
+        internal static class SslBinder
         {
-            public static void Bind(int port, X509Certificate2 cert)
-            {
-                string ipPort = $"0.0.0.0:{port}";
-                var cfg = new HTTP_SERVICE_CONFIG_SSL_SET
-                {
-                    Key = new HTTP_SERVICE_CONFIG_SSL_KEY(ipPort),
-                    Param = HTTP_SERVICE_CONFIG_SSL_PARAM.Create(cert)
-                };
-                uint ret = HttpSetServiceConfiguration(IntPtr.Zero,
-                    HTTP_SERVICE_CONFIG_ID.HttpServiceConfigSSLCertInfo,
-                    ref cfg, Marshal.SizeOf(cfg), IntPtr.Zero);
+            [DllImport("httpapi.dll", SetLastError = true)]
+            private static extern uint HttpInitialize(HttpApiVersion version, uint flags, IntPtr pReserved);
 
-                const uint ERR_EXISTS = 183;
-                if (ret != 0 && ret != ERR_EXISTS)
-                    throw new Win32Exception((int)ret, "SSL 证书绑定失败。");
+            [DllImport("httpapi.dll", SetLastError = true)]
+            private static extern uint HttpSetServiceConfiguration(IntPtr s, HttpServiceConfigId id, IntPtr p, int l,
+                IntPtr o);
+
+            [DllImport("httpapi.dll", SetLastError = true)]
+            private static extern uint HttpDeleteServiceConfiguration(IntPtr s, HttpServiceConfigId id, IntPtr p, int l,
+                IntPtr o);
+
+            [DllImport("httpapi.dll", SetLastError = true)]
+            private static extern uint HttpTerminate(uint flags, IntPtr pReserved);
+
+            [StructLayout(LayoutKind.Sequential, Pack = 2)]
+            private struct HttpApiVersion
+            {
+                public ushort HttpApiMajorVersion;
+                public ushort HttpApiMinorVersion;
+
+                public HttpApiVersion(ushort major, ushort minor)
+                {
+                    HttpApiMajorVersion = major;
+                    HttpApiMinorVersion = minor;
+                }
             }
 
-            private enum HTTP_SERVICE_CONFIG_ID
+            private enum HttpServiceConfigId
             {
                 HttpServiceConfigSSLCertInfo = 1
             }
 
             [StructLayout(LayoutKind.Sequential)]
-            private struct HTTP_SERVICE_CONFIG_SSL_SET
-            {
-                public HTTP_SERVICE_CONFIG_SSL_KEY Key;
-                public HTTP_SERVICE_CONFIG_SSL_PARAM Param;
-            }
-
-            [StructLayout(LayoutKind.Sequential)]
-            private struct HTTP_SERVICE_CONFIG_SSL_KEY
+            private struct HttpServiceConfigSslKey
             {
                 public IntPtr pIpPort;
 
-                public HTTP_SERVICE_CONFIG_SSL_KEY(string s) =>
-                    pIpPort = Marshal.StringToHGlobalUni(s);
-            }
-
-            [StructLayout(LayoutKind.Sequential)]
-            private struct HTTP_SERVICE_CONFIG_SSL_PARAM
-            {
-                public uint SslHashLength;
-                public IntPtr pSslHash;
-                public Guid AppId;
-                public IntPtr pStoreName;
-
-                public uint DefaultCertCheckMode,
-                    DefaultRevocationFreshnessTime,
-                    DefaultRevocationUrlRetrievalTimeout;
-
-                public IntPtr pDefaultSslCtlIdentifier, pDefaultSslCtlStoreName;
-                public uint DefaultFlags;
-
-                public static HTTP_SERVICE_CONFIG_SSL_PARAM Create(X509Certificate2 cert)
+                public HttpServiceConfigSslKey(IntPtr pIpPort)
                 {
-                    byte[] hash = cert.GetCertHash();
-                    IntPtr hashPtr = Marshal.AllocHGlobal(hash.Length);
-                    Marshal.Copy(hash, 0, hashPtr, hash.Length);
-
-                    return new HTTP_SERVICE_CONFIG_SSL_PARAM
-                    {
-                        SslHashLength = (uint)hash.Length,
-                        pSslHash = hashPtr,
-                        AppId = Guid.NewGuid(),
-                        pStoreName = Marshal.StringToHGlobalUni("MY")
-                    };
+                    this.pIpPort = pIpPort;
                 }
             }
 
-            [DllImport("httpapi.dll", SetLastError = true)]
-            private static extern uint HttpSetServiceConfiguration(
-                IntPtr service, HTTP_SERVICE_CONFIG_ID id,
-                ref HTTP_SERVICE_CONFIG_SSL_SET info, int cbInfo, IntPtr overlapped);
+            [StructLayout(LayoutKind.Sequential, Pack = 4)]
+            private struct HttpServiceConfigSslParam
+            {
+                public int SslHashLength;
+                public IntPtr pSslHash;
+                public Guid AppId;
+                public IntPtr pSslCertStoreName;
+                public uint DefaultCertCheckMode;
+                public int DefaultRevocationFreshnessTime;
+                public int DefaultRevocationUrlRetrievalTimeout;
+                public IntPtr pDefaultSslCtlIdentifier;
+                public IntPtr pDefaultSslCtlStoreName;
+                public uint DefaultFlags;
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            private struct HttpServiceConfigSslSet
+            {
+                public HttpServiceConfigSslKey KeyDesc;
+                public HttpServiceConfigSslParam ParamDesc;
+            }
+
+            private const uint HTTP_INITIALIZE_CONFIG = 0x00000002;
+            private const uint NO_ERROR = 0;
+
+            public static void Bind(IPAddress ipAddress, int port, X509Certificate2 certificate)
+            {
+                Execute(ipAddress, port,
+                    (pSslSet, size) => HttpSetServiceConfiguration(IntPtr.Zero,
+                        HttpServiceConfigId.HttpServiceConfigSSLCertInfo, pSslSet, size, IntPtr.Zero), certificate);
+            }
+
+            public static void Unbind(IPAddress ipAddress, int port)
+            {
+                Execute(ipAddress, port,
+                    (pSslSet, size) => HttpDeleteServiceConfiguration(IntPtr.Zero,
+                        HttpServiceConfigId.HttpServiceConfigSSLCertInfo, pSslSet, size, IntPtr.Zero));
+            }
+
+            private static void Execute(IPAddress ipAddress, int port, Func<IntPtr, int, uint> httpApiFunc,
+                X509Certificate2? certificate = null)
+            {
+                var version = new HttpApiVersion(1, 0);
+                var retVal = HttpInitialize(version, HTTP_INITIALIZE_CONFIG, IntPtr.Zero);
+                if (retVal != NO_ERROR) throw new Win32Exception((int)retVal, "HttpInitialize failed.");
+
+                var ipEndPoint = new IPEndPoint(ipAddress, port);
+                SocketAddress sockAddr = ipEndPoint.Serialize();
+                var sockAddrPtr = Marshal.AllocHGlobal(sockAddr.Size);
+                GCHandle? hashHandle = null;
+                var pSslSet = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(HttpServiceConfigSslSet)));
+                IntPtr pCertStoreName = IntPtr.Zero;
+
+                try
+                {
+                    for (int i = 0; i < sockAddr.Size; i++) Marshal.WriteByte(sockAddrPtr, i, sockAddr[i]);
+
+                    var sslSet = new HttpServiceConfigSslSet { KeyDesc = new HttpServiceConfigSslKey(sockAddrPtr) };
+
+                    if (certificate != null)
+                    {
+                        var certHash = certificate.GetCertHash() ??
+                                       throw new ArgumentException("Certificate has no hash.");
+                        hashHandle = GCHandle.Alloc(certHash, GCHandleType.Pinned);
+                        pCertStoreName = Marshal.StringToHGlobalUni("MY");
+                        sslSet.ParamDesc = new HttpServiceConfigSslParam
+                        {
+                            SslHashLength = certHash.Length,
+                            pSslHash = hashHandle.Value.AddrOfPinnedObject(),
+                            pSslCertStoreName = pCertStoreName,
+                            AppId = Guid.NewGuid()
+                        };
+                    }
+
+                    Marshal.StructureToPtr(sslSet, pSslSet, false);
+                    retVal = httpApiFunc(pSslSet, Marshal.SizeOf(typeof(HttpServiceConfigSslSet)));
+
+                    const int ERROR_FILE_NOT_FOUND = 2; // This is OK for delete operations.
+                    if (retVal != NO_ERROR && retVal != ERROR_FILE_NOT_FOUND)
+                    {
+                        throw new Win32Exception((int)retVal, "HTTP API call failed.");
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(sockAddrPtr);
+                    Marshal.FreeHGlobal(pSslSet);
+                    if (hashHandle?.IsAllocated == true) hashHandle.Value.Free();
+                    if (pCertStoreName != IntPtr.Zero) Marshal.FreeHGlobal(pCertStoreName);
+                    HttpTerminate(0, IntPtr.Zero);
+                }
+            }
         }
 
         #endregion
