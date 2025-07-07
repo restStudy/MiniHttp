@@ -196,7 +196,7 @@ namespace MiniHttp
 
         private async Task ProcessAsync(HttpListenerContext ctx)
         {
-            string host = (ctx.Request.UserHostName ?? "*").ToLowerInvariant();
+            string host = (ctx.Request.UserHostName ?? "*").Split(':')[0].ToLowerInvariant();
             string path = ctx.Request.Url!.AbsolutePath;
             string method = ctx.Request.HttpMethod.ToUpperInvariant();
 
