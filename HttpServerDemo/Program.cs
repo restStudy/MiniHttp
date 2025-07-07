@@ -12,6 +12,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using HttpMultipartParser;
 
 namespace HttpServerDemo
 {
@@ -151,8 +152,43 @@ namespace HttpServerDemo
             }
         }
 
-        // [修复] 重写整个文件上传处理方法，使其能正确处理二进制数据。
+        // [修复] 使用流式解析库，实现高速、低内存上传
         static async Task HandleFileUploadAsync(HttpListenerContext ctx, string uploadDir)
+        {
+            try
+            {
+                // 使用流式解析器，直接将请求的输入流传给它
+                var parser = await MultipartFormDataParser.ParseAsync(ctx.Request.InputStream);
+
+                // 查找名为 "file" 的文件部分 (与前端JS中的 formData.append('file', ...) 对应)
+                var filePart = parser.Files.FirstOrDefault(f => f.Name == "file");
+
+                if (filePart == null)
+                {
+                    ctx.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteTextAsync(ctx, "错误: 未找到名为 'file' 的上传文件部分。");
+                    return;
+                }
+
+                var fileName = Path.GetFileName(filePart.FileName); // 获取安全的文件名
+                var savePath = Path.Combine(uploadDir, fileName);
+
+                // 将解析出的文件数据流，直接写入到磁盘文件流中
+                using (var fileStream = new FileStream(savePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    await filePart.Data.CopyToAsync(fileStream);
+                }
+
+                await WriteTextAsync(ctx, $"文件 '{fileName}' 上传成功！");
+            }
+            catch (Exception ex)
+            {
+                ctx.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+                await WriteTextAsync(ctx, $"文件上传时发生服务器内部错误: {ex.Message}");
+            }
+        }
+        // [修复] 重写整个文件上传处理方法，使其能正确处理二进制数据。
+        static async Task _HandleFileUploadAsync(HttpListenerContext ctx, string uploadDir)
         {
             try
             {
