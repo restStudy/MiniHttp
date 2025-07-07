@@ -42,18 +42,15 @@ namespace MiniHttp
         public void Start(X509Certificate2? httpsCert = null)
         {
             if (IsRunning) return;
-
             if (HttpsPort.HasValue && httpsCert != null)
             {
-                // 【强制清场修正】在绑定前，先尝试进行一次清理。
                 try
                 {
                     SslBinder.Unbind(IPAddress.Any, HttpsPort.Value);
-                    Console.WriteLine($"[Info] 启动前预清理端口 {HttpsPort.Value} 成功。");
                 }
-                catch (Exception ex)
+                catch
                 {
-                    Console.WriteLine($"[Warning] 启动前预清理端口失败（可能端口本就干净）: {ex.Message}");
+                    /* 预清理，忽略失败 */
                 }
 
                 try
@@ -70,7 +67,6 @@ namespace MiniHttp
             if (HttpPort > 0) _listener.Prefixes.Add($"http://+:{HttpPort}/");
             if (HttpsPort.HasValue) _listener.Prefixes.Add($"https://+:{HttpsPort.Value}/");
             if (_listener.Prefixes.Count == 0) throw new InvalidOperationException("未指定任何前缀。");
-
             _listener.Start();
             _cts = new CancellationTokenSource();
             _ = Task.Run(() => AcceptLoop(_cts.Token));
@@ -80,7 +76,6 @@ namespace MiniHttp
         public void Stop()
         {
             if (!IsRunning && !_isSslBound) return;
-
             try
             {
                 if (IsRunning)
@@ -96,13 +91,10 @@ namespace MiniHttp
                     try
                     {
                         SslBinder.Unbind(IPAddress.Any, HttpsPort.Value);
-                        Console.WriteLine($"[Info] SSL 证书已成功从端口 {HttpsPort.Value} 解除绑定。");
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        Console.WriteLine($"[Warning] 自动解除SSL证书绑定失败: {ex.Message}");
-                        Console.WriteLine(
-                            $"[Warning] 您可能需要手动运行 'netsh http delete sslcert ipport=0.0.0.0:{HttpsPort.Value}' 来清理。");
+                        /* 忽略失败 */
                     }
 
                     _isSslBound = false;
@@ -116,17 +108,17 @@ namespace MiniHttp
 
         #region 2. 路由容器
 
-        private readonly ConcurrentDictionary<(string, string, string), Func<HttpListenerContext, Task>> _httpRoutes
-            = new ConcurrentDictionary<(string, string, string), Func<HttpListenerContext, Task>>();
+        private readonly ConcurrentDictionary<(string, string, string), Func<HttpListenerContext, Task>> _httpRoutes =
+            new ConcurrentDictionary<(string, string, string), Func<HttpListenerContext, Task>>();
 
-        private readonly ConcurrentDictionary<(string, string), Func<WebSocket, Task>> _wsRoutes
-            = new ConcurrentDictionary<(string, string), Func<WebSocket, Task>>();
+        private readonly ConcurrentDictionary<(string, string), Func<WebSocket, Task>> _wsRoutes =
+            new ConcurrentDictionary<(string, string), Func<WebSocket, Task>>();
 
-        private readonly ConcurrentDictionary<string, StaticDirEntry> _hostRoots
-            = new ConcurrentDictionary<string, StaticDirEntry>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, StaticDirEntry> _hostRoots =
+            new ConcurrentDictionary<string, StaticDirEntry>(StringComparer.OrdinalIgnoreCase);
 
-        private readonly ConcurrentDictionary<(string, string), StaticDirEntry> _staticDirs
-            = new ConcurrentDictionary<(string, string), StaticDirEntry>();
+        private readonly ConcurrentDictionary<(string, string), StaticDirEntry> _staticDirs =
+            new ConcurrentDictionary<(string, string), StaticDirEntry>();
 
         private sealed class StaticDirEntry
         {
@@ -140,22 +132,16 @@ namespace MiniHttp
 
         public void MapHostToRoot(string host, string physicalDir, bool browse = false)
         {
-            if (string.IsNullOrWhiteSpace(host))
-                throw new ArgumentException("host 不能为空。");
-
+            if (string.IsNullOrWhiteSpace(host)) throw new ArgumentException("host 不能为空。");
             var fullDir = Path.GetFullPath(physicalDir);
-            if (!Directory.Exists(fullDir))
-                throw new DirectoryNotFoundException(fullDir);
-
-            _hostRoots[host.ToLowerInvariant()] = new StaticDirEntry
-                { PhysicalDir = fullDir, EnableBrowse = browse };
+            if (!Directory.Exists(fullDir)) throw new DirectoryNotFoundException(fullDir);
+            _hostRoots[host.ToLowerInvariant()] = new StaticDirEntry { PhysicalDir = fullDir, EnableBrowse = browse };
         }
 
         public void AddRoute(string? host, string method, string path, Func<HttpListenerContext, Task> handler)
         {
             host ??= "*";
-            if (string.IsNullOrWhiteSpace(path) || path[0] != '/')
-                throw new ArgumentException("path 必须以 / 开头");
+            if (string.IsNullOrWhiteSpace(path) || path[0] != '/') throw new ArgumentException("path 必须以 / 开头");
             _httpRoutes[(method.ToUpperInvariant(), host.ToLowerInvariant(), path)] =
                 handler ?? throw new ArgumentNullException(nameof(handler));
         }
@@ -166,8 +152,7 @@ namespace MiniHttp
         public void AddWebSocket(string? host, string path, Func<WebSocket, Task> onConnected)
         {
             host ??= "*";
-            if (string.IsNullOrWhiteSpace(path) || path[0] != '/')
-                throw new ArgumentException("path 必须以 / 开头");
+            if (string.IsNullOrWhiteSpace(path) || path[0] != '/') throw new ArgumentException("path 必须以 / 开头");
             _wsRoutes[(host.ToLowerInvariant(), path)] =
                 onConnected ?? throw new ArgumentNullException(nameof(onConnected));
         }
@@ -179,9 +164,7 @@ namespace MiniHttp
                 throw new ArgumentException("requestPrefix 必须以 / 开头");
             requestPrefix = requestPrefix.TrimEnd('/');
             var fullDir = Path.GetFullPath(physicalDir);
-            if (!Directory.Exists(fullDir))
-                throw new DirectoryNotFoundException(fullDir);
-
+            if (!Directory.Exists(fullDir)) throw new DirectoryNotFoundException(fullDir);
             _staticDirs[(host.ToLowerInvariant(), requestPrefix)] = new StaticDirEntry
                 { PhysicalDir = fullDir, EnableBrowse = browse };
         }
@@ -191,7 +174,7 @@ namespace MiniHttp
 
         #endregion
 
-        #region 4. Accept & Process (已修复)
+        #region 4. Accept & Process (路由修复版)
 
         private async Task AcceptLoop(CancellationToken token)
         {
@@ -211,7 +194,6 @@ namespace MiniHttp
             }
         }
 
-        // 在 HttpServer.cs 中找到并替换此方法
         private async Task ProcessAsync(HttpListenerContext ctx)
         {
             string host = (ctx.Request.UserHostName ?? "*").ToLowerInvariant();
@@ -220,9 +202,8 @@ namespace MiniHttp
 
             try
             {
-                // === 新的路由处理顺序 ===
-
-                // 1. WebSocket (保持最高优先级)
+                // === 新的、正确的路由处理顺序 ===
+                // 1. WebSocket
                 if (ctx.Request.IsWebSocketRequest)
                 {
                     if (TryWs(host, path, out var wsHandler))
@@ -235,49 +216,42 @@ namespace MiniHttp
                     return;
                 }
 
-                // 2. 动态API路由 (优先级提升！)
-                if (_httpRoutes.TryGetValue((method, host, path), out var h1) ||
-                    _httpRoutes.TryGetValue((method, "*", path), out h1))
+                // 2. 动态API路由
+                if (_httpRoutes.TryGetValue((method, host, path), out var apiHandler) ||
+                    _httpRoutes.TryGetValue((method, "*", path), out apiHandler))
                 {
-                    await h1(ctx);
+                    await apiHandler(ctx);
                     return;
                 }
 
-                // 3. 域名根目录映射 (现在是第三优先级)
-                if (_hostRoots.TryGetValue(host, out var hostDirEntry))
+                // 3. 静态子目录映射 (【优先级提升!】)
+                if (TryStatic(host, path, out var staticDirEntry, out var relativePath))
+                {
+                    await ServeStaticAsync(ctx, staticDirEntry, relativePath);
+                    return;
+                }
+
+                // 4. 域名根目录映射 (【优先级降低!】)
+                if (_hostRoots.TryGetValue(host, out var hostDirEntry) || _hostRoots.TryGetValue("*", out hostDirEntry))
                 {
                     await ServeStaticAsync(ctx, hostDirEntry, path.TrimStart('/'));
                     return;
                 }
 
-                if (_hostRoots.TryGetValue("*", out var wildcardDirEntry))
-                {
-                    await ServeStaticAsync(ctx, wildcardDirEntry, path.TrimStart('/'));
-                    return;
-                }
-
-                // 4. 静态子目录 (优先级降低)
-                if (TryStatic(host, path, out var dir, out var rel))
-                {
-                    await ServeStaticAsync(ctx, dir, rel);
-                    return;
-                }
-
-                // 5. 404 Not Found
+                // 5. 404
                 ctx.Response.StatusCode = 404;
                 await WriteTextAsync(ctx, "404 Not Found");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Error] Processing request for {ctx.Request.Url}: {ex.Message}\n{ex.StackTrace}");
+                Console.WriteLine($"[Error] Processing request for {ctx.Request.Url}: {ex.Message}");
                 try
                 {
                     ctx.Response.StatusCode = 500;
                     await WriteTextAsync(ctx, "500 Internal Server Error");
                 }
-                catch (Exception responseEx)
+                catch
                 {
-                    Console.WriteLine($"[Error] Could not send 500 response: {responseEx.Message}");
                 }
             }
             finally
