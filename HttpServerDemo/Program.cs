@@ -37,7 +37,7 @@ namespace HttpServerDemo
 
             // --- 步骤 1: 加载多域名证书 ---
             Console.WriteLine("\n[1] 正在加载多域名(SAN)证书...");
-            string thumbprint = "A0201E99D353C3095EB0CE4B840FA8DE0F2EDFFD"; // <--- 粘贴您创建的多域名证书指纹
+            string thumbprint = "a18b66101858fda395eb39d519a848bee22c0ebd"; // <--- 粘贴您创建的多域名证书指纹
             X509Certificate2? certificate = LoadCertificateByThumbprint(thumbprint);
             if (certificate == null) { Console.ReadKey(); return; }
             Console.WriteLine($"成功加载证书: {certificate.Subject} (FriendlyName: {certificate.FriendlyName})");
